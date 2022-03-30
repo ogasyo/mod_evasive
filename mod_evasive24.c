@@ -56,6 +56,7 @@ pid_t getppid(void);
 #define DEFAULT_SITE_INTERVAL   1       // Default 1 Second site interval
 #define DEFAULT_BLOCKING_PERIOD 10      // Default for Detected IPs; blocked for 10 seconds
 #define DEFAULT_LOG_DIR		"/tmp"  // Default temp directory
+#define DEFAULT_X_FORWARDED_FOR_AS_REMOTE_IP 0
 
 /* END DoS Evasive Maneuvers Definitions */
 
@@ -111,6 +112,7 @@ static char *log_dir = NULL;
 static char *system_command = NULL;
 static const char *whitelist(cmd_parms *cmd, void *dconfig, const char *ip);
 int is_whitelisted(const char *ip);
+static int x_forwarded_for_as_remote_ip = DEFAULT_X_FORWARDED_FOR_AS_REMOTE_IP;
 
 /* END DoS Evasive Maneuvers Globals */
 
@@ -130,6 +132,16 @@ static const char *whitelist(cmd_parms *cmd, void *dconfig, const char *ip)
   return NULL;
 }
 
+static int extract_client_ip_from_x_forwarded_for(const char* x_forwarded_for, char* out_client_ip, int out_buffer_length){
+  const char *delimiters = ", ";
+  size_t token_length = strcspn(x_forwarded_for, delimiters);
+  if (token_length < out_buffer_length) {
+    strncpy(out_client_ip, x_forwarded_for, token_length);
+    return token_length;
+  }
+  return 0;
+}
+
 
 static int access_checker(request_rec *r) 
 {
@@ -137,17 +149,28 @@ static int access_checker(request_rec *r)
 
     /* BEGIN DoS Evasive Maneuvers Code */
 
+    /* Use X-Forwarded-For as remote IP if it exists and specified to use it */
+    const char *remote_ip = r->useragent_ip;
+    const char *forwarded_for = NULL;
+    char extract_fowarded_for_buffer[255];
+
+    if (x_forwarded_for_as_remote_ip && (forwarded_for = apr_table_get(r->headers_in, "X-Forwarded-For")) != NULL) {
+      if (extract_client_ip_from_x_forwarded_for(forwarded_for, extract_fowarded_for_buffer, 255)) {
+        remote_ip = extract_fowarded_for_buffer;
+      }
+    }
+
     if (r->prev == NULL && r->main == NULL && hit_list != NULL) {
       char hash_key[2048];
       struct ntt_node *n;
       time_t t = time(NULL);
 
       /* Check whitelist */
-      if (is_whitelisted(r->useragent_ip))
+      if (is_whitelisted(remote_ip))
         return OK;
 
       /* First see if the IP itself is on "hold" */
-      n = ntt_find(hit_list, r->useragent_ip);
+      n = ntt_find(hit_list, remote_ip);
 
       if (n != NULL && t-n->timestamp<blocking_period) {
  
@@ -159,14 +182,14 @@ static int access_checker(request_rec *r)
       } else {
 
         /* Has URI been hit too much? */
-        snprintf(hash_key, 2048, "%s_%s", r->useragent_ip, r->uri);
+        snprintf(hash_key, 2048, "%s_%s", remote_ip, r->uri);
         n = ntt_find(hit_list, hash_key);
         if (n != NULL) {
 
           /* If URI is being hit too much, add to "hold" list and 403 */
           if (t-n->timestamp<page_interval && n->count>=page_count) {
             ret = HTTP_FORBIDDEN;
-            ntt_insert(hit_list, r->useragent_ip, time(NULL));
+            ntt_insert(hit_list, remote_ip, time(NULL));
           } else {
 
             /* Reset our hit count list as necessary */
@@ -181,14 +204,14 @@ static int access_checker(request_rec *r)
         }
 
         /* Has site been hit too much? */
-        snprintf(hash_key, 2048, "%s_SITE", r->useragent_ip);
+        snprintf(hash_key, 2048, "%s_SITE", remote_ip);
         n = ntt_find(hit_list, hash_key);
         if (n != NULL) {
 
           /* If site is being hit too much, add to "hold" list and 403 */
           if (t-n->timestamp<site_interval && n->count>=site_count) {
             ret = HTTP_FORBIDDEN;
-            ntt_insert(hit_list, r->useragent_ip, time(NULL));
+            ntt_insert(hit_list, remote_ip, time(NULL));
           } else {
 
             /* Reset our hit count list as necessary */
@@ -209,27 +232,27 @@ static int access_checker(request_rec *r)
         struct stat s;
         FILE *file;
 
-        snprintf(filename, sizeof(filename), "%s/dos-%s", log_dir != NULL ? log_dir : DEFAULT_LOG_DIR, r->useragent_ip);
+        snprintf(filename, sizeof(filename), "%s/dos-%s", log_dir != NULL ? log_dir : DEFAULT_LOG_DIR, remote_ip);
         if (stat(filename, &s)) {
           file = fopen(filename, "w");
           if (file != NULL) {
             fprintf(file, "%d\n", getpid());
             fclose(file);
 
-            LOG(LOG_ALERT, "Blacklisting address %s: possible DoS attack.", r->useragent_ip);
+            LOG(LOG_ALERT, "Blacklisting address %s: possible DoS attack.", remote_ip);
             if (email_notify != NULL) {
               snprintf(filename, sizeof(filename), MAILER, email_notify);
               file = popen(filename, "w");
               if (file != NULL) {
                 fprintf(file, "To: %s\n", email_notify);
-                fprintf(file, "Subject: HTTP BLACKLIST %s\n\n", r->useragent_ip);
-                fprintf(file, "mod_evasive HTTP Blacklisted %s\n", r->useragent_ip);
+                fprintf(file, "Subject: HTTP BLACKLIST %s\n\n", remote_ip);
+                fprintf(file, "mod_evasive HTTP Blacklisted %s\n", remote_ip);
                 pclose(file);
               }
             }
 
             if (system_command != NULL) {
-              snprintf(filename, sizeof(filename), system_command, r->useragent_ip);
+              snprintf(filename, sizeof(filename), system_command, remote_ip);
               system(filename);
             }
  
@@ -646,7 +669,18 @@ get_system_command(cmd_parms *cmd, void *dconfig, const char *value) {
   }
  
   return NULL;
-} 
+}
+
+static const char*
+get_x_forwarded_for_as_remote_ip(cmd_parms *cmd, void *dconfig, const char *value){
+  long n = strtol(value, NULL, 0);
+  if (n>0) {
+    x_forwarded_for_as_remote_ip = 1;
+  } else {
+    x_forwarded_for_as_remote_ip = 0;
+  }
+  return NULL;
+}
 
 /* END Configuration Functions */
 
@@ -655,19 +689,19 @@ static const command_rec access_cmds[] =
 	AP_INIT_TAKE1("DOSHashTableSize", get_hash_tbl_size, NULL, RSRC_CONF, 
 		"Set size of hash table"),
 
-        AP_INIT_TAKE1("DOSPageCount", get_page_count, NULL, RSRC_CONF,
+  AP_INIT_TAKE1("DOSPageCount", get_page_count, NULL, RSRC_CONF,
 		"Set maximum page hit count per interval"),
 
-        AP_INIT_TAKE1("DOSSiteCount", get_site_count, NULL, RSRC_CONF,
+  AP_INIT_TAKE1("DOSSiteCount", get_site_count, NULL, RSRC_CONF,
 		"Set maximum site hit count per interval"),
 
-        AP_INIT_TAKE1("DOSPageInterval", get_page_interval, NULL, RSRC_CONF,
+  AP_INIT_TAKE1("DOSPageInterval", get_page_interval, NULL, RSRC_CONF,
 		"Set page interval"),
 
 	AP_INIT_TAKE1("DOSSiteInterval", get_site_interval, NULL, RSRC_CONF,
 		"Set site interval"),
 
-        AP_INIT_TAKE1("DOSBlockingPeriod", get_blocking_period, NULL, RSRC_CONF,
+  AP_INIT_TAKE1("DOSBlockingPeriod", get_blocking_period, NULL, RSRC_CONF,
 		"Set blocking period for detected DoS IPs"),
 
 	AP_INIT_TAKE1("DOSEmailNotify", get_email_notify, NULL, RSRC_CONF,
@@ -679,8 +713,11 @@ static const command_rec access_cmds[] =
 	AP_INIT_TAKE1("DOSSystemCommand", get_system_command, NULL, RSRC_CONF,
 		"Set system command on DoS"),
 
-        AP_INIT_ITERATE("DOSWhitelist", whitelist, NULL, RSRC_CONF,
-                "IP-addresses wildcards to whitelist"),
+  AP_INIT_ITERATE("DOSWhitelist", whitelist, NULL, RSRC_CONF,
+    "IP-addresses wildcards to whitelist"),
+
+  AP_INIT_TAKE1("DOSXForwardedForAsRemoteIP", get_x_forwarded_for_as_remote_ip, NULL, RSRC_CONF,
+    "Set whether to treat X-Forwarded-For as remote IP"),
 
 	{ NULL }
 };
