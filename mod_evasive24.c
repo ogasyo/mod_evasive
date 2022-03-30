@@ -135,7 +135,8 @@ static const char *whitelist(cmd_parms *cmd, void *dconfig, const char *ip)
 static int extract_client_ip_from_x_forwarded_for(const char* x_forwarded_for, char* out_client_ip, int out_buffer_length){
   const char *delimiters = ", ";
   size_t token_length = strcspn(x_forwarded_for, delimiters);
-  if (token_length < out_buffer_length) {
+  // xxx.xxx.xxx.xxx => 15
+  if (token_length < out_buffer_length && token_length <= 15) {
     strncpy(out_client_ip, x_forwarded_for, token_length);
     return token_length;
   }
